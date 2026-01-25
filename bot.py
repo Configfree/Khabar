@@ -1,95 +1,172 @@
 # -*- coding: utf-8 -*-
 
-""" نسخه نهایی فقط مخصوص کانال روبیکا (بدون گروه)
+"""
+Rubika Channel Forwarder (Telegram Web Scraper)
+Only Channel | No Group | Stable Version
+"""
 
-✔️ بدون نیاز به ادمین گروه ✔️ GUID کانال فقط یک‌بار گرفته و ذخیره می‌شود ✔️ مناسب GitHub Actions ✔️ دریافت محتوا از کانال‌های عمومی تلگرام (Web) ✔️ ارسال فقط پیام متنی یا دارای عکس (بدون ویدیو و فایل) """
+import os
+import time
+import json
+import re
+import requests
+from bs4 import BeautifulSoup
 
-import time, json, os, re, requests from bs4 import BeautifulSoup
+# ================== CONFIG ==================
+SOURCES = [
+    "https://t.me/s/iranfnews",
+    "https://t.me/s/khabarfuri",
+]
 
-================= تنظیمات =================
+RUBIKA_TOKEN = os.getenv("RUBIKA_BOT_TOKEN")
+TARGET_USERNAME = "shortnews_ir"  # بدون @
 
-SOURCES = [ "https://t.me/s/iranfnews", "https://t.me/s/khabarfuri", ]
+STATE_FILE = "state.json"
+GUID_FILE = "channel_guid.json"
+# ============================================
 
-RUBIKA_BOT_TOKEN = os.getenv("RUBIKA_BOT_TOKEN") TARGET_USERNAME = "shortnews_ir"   # بدون @
 
-STATE_FILE = "state.json" GUID_FILE = "channel_guid.json" CHECK_INTERVAL = 180
+# ---------- Utils ----------
+def log(msg):
+    print(msg, flush=True)
 
-==========================================
 
-def load_channel_guid(): if os.path.exists(GUID_FILE): return json.load(open(GUID_FILE, "r", encoding="utf-8")).get("channel") return None
+def load_json(path):
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {}
 
-def save_channel_guid(guid): json.dump({"channel": guid}, open(GUID_FILE, "w", encoding="utf-8"))
 
-def find_channel_guid(): """GUID کانال را از getUpdates فقط یک‌بار می‌گیرد""" url = f"https://botapi.rubika.ir/v3/{RUBIKA_BOT_TOKEN}/getUpdates" res = requests.post(url, json={"limit": 50}).json()
+def save_json(path, data):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
 
-for u in res.get("updates", []):
-    chat_id = u.get("chat_id") or u.get("update", {}).get("chat_id")
-    if chat_id and chat_id.startswith("c"):
-        save_channel_guid(chat_id)
-        return chat_id
-return None
 
-def clean_text(text): if not text: return "" text = re.sub(r"https?://t.me/\S+", f"@{TARGET_USERNAME}", text) text = re.sub(r"@\w+", f"@{TARGET_USERNAME}", text) return text.strip()
+# ---------- Rubika ----------
+def get_channel_guid():
+    if os.path.exists(GUID_FILE):
+        return load_json(GUID_FILE).get("channel")
 
-def fetch_posts(url): r = requests.get(url, timeout=20) soup = BeautifulSoup(r.text, "html.parser") posts = []
+    url = f"https://botapi.rubika.ir/v3/{RUBIKA_TOKEN}/getUpdates"
+    try:
+        res = requests.post(url, json={"limit": 50}, timeout=20).json()
+    except Exception:
+        return None
 
-for msg in soup.select("div.tgme_widget_message"):
-    pid = msg.get("data-post")
-    if not pid:
-        continue
+    for upd in res.get("updates", []):
+        chat_id = upd.get("chat_id") or upd.get("update", {}).get("chat_id")
+        if isinstance(chat_id, str) and chat_id.startswith("c"):
+            save_json(GUID_FILE, {"channel": chat_id})
+            return chat_id
 
-    text_el = msg.select_one("div.tgme_widget_message_text")
-    text = text_el.get_text("\n", strip=True) if text_el else ""
+    return None
 
-    photo = None
-    img = msg.select_one("a.tgme_widget_message_photo_wrap")
-    if img and img.get("style") and "url('" in img.get("style"):
-        photo = img.get("style").split("url('")[1].split("')")[0]
 
-    # رد کردن ویدیو و فایل
-    if msg.select_one("video") or msg.select_one("a.tgme_widget_message_document"):
-        continue
-
-    posts.append({"id": pid, "text": text, "photo": photo})
-
-return posts
-
-def send_message(channel_guid, text): requests.post( f"https://botapi.rubika.ir/v3/{RUBIKA_BOT_TOKEN}/sendMessage", json={"chat_id": channel_guid, "text": text} )
-
-def send_photo(channel_guid, photo, caption=""): requests.post( f"https://botapi.rubika.ir/v3/{RUBIKA_BOT_TOKEN}/sendPhoto", json={"chat_id": channel_guid, "photo_url": photo, "caption": caption} )
-
-def main(): channel_guid = load_channel_guid()
-
-if not channel_guid:
-    print("🔍 GUID کانال ذخیره نشده، در حال جستجو...")
-    channel_guid = find_channel_guid()
-    if not channel_guid:
-        print("❌ GUID کانال پیدا نشد | بات باید ادمین کانال باشد و یک پیام تست بفرستی")
+def send_message(chat_id, text):
+    if not text:
         return
-    print("✅ GUID کانال ذخیره شد")
+    requests.post(
+        f"https://botapi.rubika.ir/v3/{RUBIKA_TOKEN}/sendMessage",
+        json={"chat_id": chat_id, "text": text},
+        timeout=20,
+    )
 
-state = {}
-if os.path.exists(STATE_FILE):
-    state = json.load(open(STATE_FILE, "r", encoding="utf-8"))
 
-for src in SOURCES:
-    last_id = state.get(src)
-    posts = fetch_posts(src)
-    posts.reverse()
+def send_photo(chat_id, photo_url, caption=""):
+    requests.post(
+        f"https://botapi.rubika.ir/v3/{RUBIKA_TOKEN}/sendPhoto",
+        json={
+            "chat_id": chat_id,
+            "photo_url": photo_url,
+            "caption": caption,
+        },
+        timeout=20,
+    )
 
-    for p in posts:
-        if last_id and p["id"] == last_id:
+
+# ---------- Telegram Web ----------
+def clean_text(text):
+    if not text:
+        return ""
+
+    text = re.sub(r"https?://t\.me/\S+", f"@{TARGET_USERNAME}", text)
+    text = re.sub(r"@\w+", f"@{TARGET_USERNAME}", text)
+
+    return text.strip()
+
+
+def fetch_posts(source_url):
+    posts = []
+
+    try:
+        r = requests.get(source_url, timeout=30)
+    except Exception:
+        return posts
+
+    soup = BeautifulSoup(r.text, "html.parser")
+
+    for msg in soup.select("div.tgme_widget_message"):
+        post_id = msg.get("data-post")
+        if not post_id:
             continue
 
-        text = clean_text(p["text"])
+        # skip video & files
+        if msg.select_one("video") or msg.select_one(".tgme_widget_message_document"):
+            continue
 
-        if p["photo"]:
-            send_photo(channel_guid, p["photo"], text)
-        else:
-            send_message(channel_guid, text)
+        text_el = msg.select_one(".tgme_widget_message_text")
+        text = text_el.get_text("\n", strip=True) if text_el else ""
 
-        state[src] = p["id"]
-        json.dump(state, open(STATE_FILE, "w", encoding="utf-8"))
-        time.sleep(1)
+        photo = None
+        photo_el = msg.select_one(".tgme_widget_message_photo_wrap")
+        if photo_el and "url('" in photo_el.get("style", ""):
+            photo = photo_el["style"].split("url('")[1].split("')")[0]
 
-if name == "main": main()
+        posts.append({
+            "id": post_id,
+            "text": text,
+            "photo": photo
+        })
+
+    return posts
+
+
+# ---------- Main ----------
+def main():
+    if not RUBIKA_TOKEN:
+        log("❌ RUBIKA_BOT_TOKEN تنظیم نشده")
+        return
+
+    channel_guid = get_channel_guid()
+    if not channel_guid:
+        log("❌ GUID کانال پیدا نشد | بات باید ادمین کانال باشد و یک پیام تست ارسال شود")
+        return
+
+    log("✅ بات فعال شد")
+
+    state = load_json(STATE_FILE)
+
+    for src in SOURCES:
+        last_id = state.get(src)
+        posts = fetch_posts(src)
+        posts.reverse()
+
+        for p in posts:
+            if last_id == p["id"]:
+                continue
+
+            text = clean_text(p["text"])
+
+            if p["photo"]:
+                send_photo(channel_guid, p["photo"], text)
+            else:
+                send_message(channel_guid, text)
+
+            state[src] = p["id"]
+            save_json(STATE_FILE, state)
+            time.sleep(1)
+
+
+if __name__ == "__main__":
+    main()
