@@ -1,8 +1,9 @@
 import requests
 import re
 import os
-import json
 import time
+import json
+from bs4 import BeautifulSoup
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ========== تنظیمات روبیکا ==========
@@ -14,233 +15,367 @@ RUBIKA_HEADERS = {"Content-Type": "application/json"}
 SOURCE_CHANNEL = "KhabarFuri"
 LAST_ID_FILE = "last_message_id.txt"
 
-# ========== فوتر ==========
+# ========== سشن‌های سراسری ==========
+# NOTE: برای ۴ worker همزمان، این سشن‌ها thread-safe هستند
+TG_SESSION = requests.Session()
+TG_SESSION.headers.update({
+    "User-Agent": "Mozilla/5.0",
+    "Connection": "keep-alive"
+})
+
+RUBIKA_SESSION = requests.Session()
+RUBIKA_SESSION.headers.update(RUBIKA_HEADERS)
+
+# ========== فوتر خطی ساده ==========
 FOOTER = """
 ────────────────────
 @NewsLine360
 ────────────────────
 """
 
-def clean_and_format(text):
+# ========== کامپایل Regexها ==========
+EMOJI_PATTERN = re.compile(
+    "["
+    "\U0001F600-\U0001F64F"
+    "\U0001F300-\U0001F5FF"
+    "\U0001F680-\U0001F6FF"
+    "\U0001F700-\U0001F77F"
+    "\U0001F780-\U0001F7FF"
+    "\U0001F800-\U0001F8FF"
+    "\U0001F900-\U0001F9FF"
+    "\U0001FA00-\U0001FA6F"
+    "\U0001FA70-\U0001FAFF"
+    "\U00002702-\U000027B0"
+    "\U000024C2-\U0001F251"
+    "\U0001F1E0-\U0001F1FF"
+    "]+",
+    flags=re.UNICODE
+)
+
+SOURCE_LINK_PATTERN = re.compile(r'@KhabarFuri\b')
+SOURCE_URL_PATTERN = re.compile(r'https?://t\.me/(?:s/)?KhabarFuri[^\s]*')
+MULTI_SPACE_PATTERN = re.compile(r'[ ]{2,}')
+MULTI_NEWLINE_PATTERN = re.compile(r'\n{3,}')
+KHABARFURI_PATTERN = re.compile(r'@KhabarFuri\s*')
+PHOTO_URL_PATTERN = re.compile(r"url\('([^']+)'\)")
+PHOTO_SIZE_PATTERN = re.compile(r'_[sb]\d+\.jpg')
+
+def remove_all_emojis(text):
+    """حذف همه ایموجی‌ها - پرچم‌ها و صورتک‌ها"""
     if not text:
+        return ""
+    
+    text = EMOJI_PATTERN.sub('', text)
+    text = MULTI_SPACE_PATTERN.sub(' ', text)
+    text = MULTI_NEWLINE_PATTERN.sub('\n\n', text)
+    
+    return text.strip()
+
+def replace_source_links(text):
+    """جایگزینی لینک‌های کانال مبدأ با کانال خودمون"""
+    if not text:
+        return ""
+    
+    text = SOURCE_LINK_PATTERN.sub(RUBIKA_CHANNEL, text)
+    text = SOURCE_URL_PATTERN.sub('https://t.me/NewsLine360', text)
+    
+    return text
+
+def add_footer(text):
+    """اضافه کردن فوتر خطی"""
+    if not text or not text.strip():
         return FOOTER.strip()
-    # حذف تگ
-    text = re.sub(r'@KhabarFuri\s*', '', text)
-    # حذف ایموجی‌ها (از جمله پرچم)
-    text = re.sub(r'[\U0001F600-\U0001F64F\U0001F300-\U0001F5FF\U0001F680-\U0001F6FF\U0001F1E0-\U0001F1FF]+', '', text)
-    # حذف لینک‌های کانال مبدأ
-    text = re.sub(r'https?://t\.me/[^\s]+', '', text)
-    # حذف فاصله‌های اضافی
-    text = re.sub(r'[ ]{2,}', ' ', text)
-    # حذف خطوط خالی تکراری
-    text = re.sub(r'\n{3,}', '\n\n', text)
+    
     return f"{text.strip()}\n\n{FOOTER.strip()}"
 
-def extract_data_from_page(html):
-    """استخراج مستقیم با regex بدون BeautifulSoup (فقط برای سرعت)"""
-    # الگوی پیام‌ها
-    msg_pattern = r'data-post="([^"]+)"[^>]*>(.*?)<div class="tgme_widget_message_footer'
-    msgs = re.findall(msg_pattern, html, re.DOTALL)
+def clean_and_format(text):
+    """تمیزکاری کامل متن قبل از ارسال"""
+    if not text:
+        return FOOTER.strip()
     
-    results = []
-    for data_post, content in msgs:
-        if not data_post:
-            continue
-        
-        msg_id = int(data_post.split('/')[-1])
-        
-        # استخراج متن
-        text_match = re.search(r'<div class="tgme_widget_message_text"[^>]*>(.*?)</div>', content, re.DOTALL)
-        text = re.sub(r'<[^>]+>', '', text_match.group(1)) if text_match else ""
-        
-        # استخراج عکس‌ها (آلبوم)
-        photo_matches = re.findall(r'<a class="tgme_widget_message_photo_wrap"[^>]+style="background-image:url\(\'([^\']+)\'\)"', content)
-        photos = [re.sub(r'_[sb]\d+\.jpg', '.jpg', p) for p in photo_matches]
-        
-        # استخراج ویدیو
-        video_match = re.search(r'<video[^>]+src="([^"]+)"', content)
-        video = video_match.group(1) if video_match else None
-        if not video:
-            video_match = re.search(r'<source[^>]+src="([^"]+)"', content)
-            video = video_match.group(1) if video_match else None
-        
-        # فقط پیام‌های حاوی تگ
-        if '@KhabarFuri' in text:
-            results.append({
-                'id': msg_id,
-                'text': text,
-                'photos': photos,
-                'video': video
-            })
+    text = KHABARFURI_PATTERN.sub('', text)
+    text = remove_all_emojis(text)
+    text = replace_source_links(text)
+    text = add_footer(text)
     
-    return results
+    return text
 
-def upload_and_send(file_path, file_type, caption):
-    """آپلود و ارسال یک فایل به روبیکا (همان متد موفق قبلی)"""
-    rubika_url = f"https://botapi.rubika.ir/v3/{RUBIKA_TOKEN}/"
-    
-    # مرحله 1: دریافت آدرس آپلود
-    resp = requests.post(rubika_url + "requestSendFile", 
-                        data=json.dumps({"type": file_type}),
-                        headers=RUBIKA_HEADERS, timeout=10)
-    if resp.status_code != 200:
-        return False
-    upload_url = resp.json()["data"]["upload_url"]
-    
-    # مرحله 2: آپلود فایل (با بافر 128KB برای سرعت)
-    with open(file_path, 'rb') as f:
-        resp2 = requests.post(upload_url, files={"file": f}, timeout=30)
-    if resp2.status_code != 200:
-        return False
-    file_id = resp2.json()["data"]["file_id"]
-    
-    # مرحله 3: ارسال به کانال
-    payload = {"chat_id": RUBIKA_CHANNEL, "file_id": file_id, "text": clean_and_format(caption)}
-    resp3 = requests.post(rubika_url + "sendFile", data=json.dumps(payload),
-                         headers=RUBIKA_HEADERS, timeout=10)
-    
-    return resp3.status_code == 200 and resp3.json().get("status") == "OK"
-
-def download_media(url, msg_id, idx):
-    """دانلود فایل از تلگرام با کیفیت اصلی"""
-    # تشخیص نوع فایل از URL
-    ext = 'jpg' if 'photo' in url or '.jpg' in url else 'mp4'
-    file_path = f"downloads/{msg_id}_{idx}.{ext}"
-    
-    try:
-        headers = {'User-Agent': 'Mozilla/5.0'}
-        resp = requests.get(url, stream=True, headers=headers, timeout=15)
-        if resp.status_code == 200:
-            with open(file_path, 'wb') as f:
-                # بافر 128KB برای سرعت بالاتر و کیفیت یکسان
-                for chunk in resp.iter_content(chunk_size=131072):
-                    f.write(chunk)
-            return file_path
-    except Exception as e:
-        print(f"   ✗ خطا در دانلود: {e}")
-    return None
-
-def scrape():
-    print("=" * 50)
-    print("اسکرپ کانال خبری (فوق سریع)")
-    print("=" * 50)
-    
+def send_to_rubika(content_type, file_path=None, caption=""):
+    """ارسال به روبیکا با متن تمیز شده"""
     if not RUBIKA_TOKEN:
         print("❌ RUBIKA_TOKEN تنظیم نشده است")
+        return None
+    
+    rubika_url = f"https://botapi.rubika.ir/v3/{RUBIKA_TOKEN}/"
+    cleaned_caption = clean_and_format(caption)
+    
+    # فقط متن
+    if content_type == "text":
+        payload = {"chat_id": RUBIKA_CHANNEL, "text": cleaned_caption}
+        response = RUBIKA_SESSION.post(
+            rubika_url + "sendMessage",
+            data=json.dumps(payload),
+            timeout=10
+        )
+        
+        if response.status_code == 200:
+            result = response.json()
+            if result.get("status") == "OK":
+                print(f"   ✓ متن ارسال شد")
+            else:
+                print(f"   ✗ خطا: {result}")
+        return response
+    
+    # عکس یا ویدیو
+    elif content_type in ["photo", "video"]:
+        file_type = "Image" if content_type == "photo" else "Video"
+        
+        # مرحله 1: دریافت آدرس آپلود
+        resp_upload = RUBIKA_SESSION.post(
+            rubika_url + "requestSendFile",
+            data=json.dumps({"type": file_type}),
+            timeout=10
+        )
+        
+        if resp_upload.status_code != 200:
+            print(f"   ✗ خطا در دریافت آدرس آپلود")
+            return None
+            
+        upload_data = resp_upload.json()
+        if upload_data.get("status") != "OK":
+            print(f"   ✗ خطا: {upload_data}")
+            return None
+            
+        upload_url = upload_data["data"]["upload_url"]
+        
+        # مرحله 2: آپلود فایل
+        with open(file_path, 'rb') as f:
+            resp_file = RUBIKA_SESSION.post(upload_url, files={"file": f}, timeout=30)
+            
+        file_data = resp_file.json()
+        if file_data.get("status") != "OK":
+            print(f"   ✗ خطا در آپلود فایل")
+            return None
+            
+        file_id = file_data["data"]["file_id"]
+        
+        # مرحله 3: ارسال به کانال
+        payload = {
+            "chat_id": RUBIKA_CHANNEL,
+            "file_id": file_id,
+            "text": cleaned_caption
+        }
+        response = RUBIKA_SESSION.post(
+            rubika_url + "sendFile",
+            data=json.dumps(payload),
+            timeout=15
+        )
+        
+        if response.status_code == 200:
+            result = response.json()
+            if result.get("status") == "OK":
+                print(f"   ✓ {content_type} ارسال شد")
+            else:
+                print(f"   ✗ خطا: {result}")
+        return response
+
+def download_file(url, file_path):
+    """دانلود فایل از لینک با streaming بهینه"""
+    try:
+        response = TG_SESSION.get(url, stream=True, timeout=30)
+        if response.status_code == 200:
+            with open(file_path, 'wb') as f:
+                # chunk size 256KB برای دانلود سریعتر
+                for chunk in response.iter_content(chunk_size=262144):
+                    f.write(chunk)
+            return True
+    except Exception:
+        pass
+    return False
+
+def safe_remove_file(file_path):
+    """حذف امن فایل بدون ایجاد خطا"""
+    try:
+        if os.path.exists(file_path):
+            os.remove(file_path)
+    except Exception:
+        pass  # خطای حذف فایل نادیده گرفته میشه
+
+def extract_media_urls(message):
+    """استخراج لینک عکس و ویدیو از پیام"""
+    # عکس
+    photo = message.find('a', class_='tgme_widget_message_photo_wrap')
+    if photo:
+        style = photo.get('style', '')
+        match = PHOTO_URL_PATTERN.search(style)
+        if match:
+            url = match.group(1)
+            url = PHOTO_SIZE_PATTERN.sub('.jpg', url)
+            return url, 'photo'
+    
+    # ویدیو
+    video = message.find('video')
+    if video and video.get('src'):
+        return video['src'], 'video'
+    
+    source = message.find('source')
+    if source and source.get('src'):
+        return source['src'], 'video'
+    
+    return None, None
+
+def get_last_processed_id():
+    """خواندن آخرین ID پردازش شده"""
+    if os.path.exists(LAST_ID_FILE):
+        with open(LAST_ID_FILE, 'r') as f:
+            try:
+                return int(f.read().strip())
+            except Exception:
+                return 0
+    return 0
+
+def save_last_processed_id(msg_id):
+    """ذخیره آخرین ID پردازش شده"""
+    try:
+        with open(LAST_ID_FILE, 'w') as f:
+            f.write(str(msg_id))
+    except Exception:
+        pass  # خطای ذخیره نادیده گرفته میشه
+
+def process_single_message(msg_id, msg):
+    """پردازش یک پیام - قابل استفاده در threading"""
+    print(f"\n📥 پردازش پیام {msg_id}")
+    
+    # استخراج متن با find سریعتر
+    text_elem = msg.find(class_='tgme_widget_message_text')
+    text = text_elem.get_text() if text_elem else ""
+    
+    # فقط پیام‌هایی که تگ دارند
+    if '@KhabarFuri' not in text:
+        print("   ⏩ رد شد (تگ @KhabarFuri ندارد)")
+        return False
+    
+    print(f"   📝 متن: {text[:80]}..." if len(text) > 80 else f"   📝 متن: {text}")
+    
+    # استخراج لینک رسانه
+    media_url, media_type = extract_media_urls(msg)
+    
+    try:
+        if media_url and media_type == 'photo':
+            print(f"   📸 در حال دانلود عکس...")
+            file_path = f"downloads/{msg_id}.jpg"
+            if download_file(media_url, file_path):
+                send_to_rubika("photo", file_path, text)
+                safe_remove_file(file_path)
+            else:
+                print(f"   ✗ خطا در دانلود عکس")
+        
+        elif media_url and media_type == 'video':
+            print(f"   🎥 در حال دانلود ویدیو...")
+            file_path = f"downloads/{msg_id}.mp4"
+            if download_file(media_url, file_path):
+                send_to_rubika("video", file_path, text)
+                safe_remove_file(file_path)
+            else:
+                print(f"   ✗ خطا در دانلود ویدیو")
+        
+        else:
+            print(f"   📝 ارسال متن...")
+            send_to_rubika("text", caption=text)
+        
+        return True
+        
+    except Exception as e:
+        print(f"   ✗ خطا: {e}")
+        return False
+
+def scrape():
+    """تابع اصلی اسکرپ کانال"""
+    print("=" * 55)
+    print("       اسکرپ کانال خبری - NewsLine360")
+    print("=" * 55)
+    
+    if not RUBIKA_TOKEN:
+        print("❌ خطا: RUBIKA_TOKEN در محیط تعریف نشده است")
         return
     
-    # آماده‌سازی
+    # ساخت پوشه موقت
     os.makedirs("downloads", exist_ok=True)
     
     # دریافت صفحه کانال
     url = f"https://t.me/s/{SOURCE_CHANNEL}"
-    print(f"\n🔍 دریافت صفحه کانال...")
+    print(f"\n🔍 در حال بررسی کانال: t.me/{SOURCE_CHANNEL}")
     
     try:
-        response = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=15)
-        if response.status_code != 200:
-            print(f"❌ خطا: کد وضعیت {response.status_code}")
-            return
+        response = TG_SESSION.get(url, timeout=15)
     except Exception as e:
         print(f"❌ خطا در اتصال: {e}")
         return
     
-    # استخراج داده‌ها با regex
-    print("📊 استخراج اطلاعات پیام‌ها...")
-    messages = extract_data_from_page(response.text)
-    
-    if not messages:
-        print("⚠️ هیچ پیامی با تگ مورد نظر پیدا نشد")
+    if response.status_code != 200:
+        print(f"❌ خطا: کد وضعیت {response.status_code}")
         return
     
-    # خواندن آخرین ID پردازش شده
-    last_id = 0
-    if os.path.exists(LAST_ID_FILE):
-        with open(LAST_ID_FILE, 'r') as f:
+    # استفاده از parser سریعتر (lxml اگر نصب باشه)
+    try:
+        soup = BeautifulSoup(response.text, "lxml")
+    except Exception:
+        soup = BeautifulSoup(response.text, "html.parser")
+    
+    messages = soup.select('.tgme_widget_message')
+    
+    if not messages:
+        print("⚠️ هیچ پیامی پیدا نشد")
+        return
+    
+    last_id = get_last_processed_id()
+    print(f"📌 آخرین ID پردازش شده: {last_id}")
+    
+    # پیدا کردن پیام‌های جدید
+    new_messages = []
+    for msg in messages:
+        data_post = msg.get('data-post', '')
+        if data_post:
             try:
-                last_id = int(f.read().strip())
-            except:
+                msg_id = int(data_post.split('/')[-1])
+                if msg_id > last_id:
+                    new_messages.append((msg_id, msg))
+            except Exception:
                 pass
     
-    # فیلتر پیام‌های جدید
-    new_messages = [m for m in messages if m['id'] > last_id]
-    new_messages.sort(key=lambda x: x['id'])
+    # مرتب سازی از قدیمی به جدید
+    new_messages.sort(key=lambda x: x[0])
     
     if not new_messages:
         print("📭 پیام جدیدی یافت نشد")
         return
     
     print(f"📨 {len(new_messages)} پیام جدید پیدا شد")
-    print("-" * 50)
+    print("-" * 55)
     
-    # پردازش پیام‌ها (از قدیمی به جدید)
-    for msg in new_messages:
-        print(f"\n📥 پردازش پیام {msg['id']}")
-        print(f"   📝 متن: {msg['text'][:50]}..." if len(msg['text']) > 50 else f"   📝 متن: {msg['text']}")
+    # پردازش موازی پیام‌ها
+    processed_ids = []
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        future_map = {
+            executor.submit(process_single_message, msg_id, msg): msg_id
+            for msg_id, msg in new_messages
+        }
         
-        # لیست فایل‌های دانلود شده
-        downloaded_files = []
-        
-        # دانلود همزمان عکس‌ها و ویدیو (حداکثر ۳ ترد)
-        with ThreadPoolExecutor(max_workers=3) as executor:
-            futures = []
-            # عکس‌ها
-            for idx, photo_url in enumerate(msg['photos']):
-                futures.append(executor.submit(download_media, photo_url, msg['id'], idx))
-            # ویدیو
-            if msg['video']:
-                futures.append(executor.submit(download_media, msg['video'], msg['id'], 0))
-            
-            # جمع‌آوری نتایج
-            for future in as_completed(futures):
-                file_path = future.result()
-                if file_path:
-                    downloaded_files.append(file_path)
-        
-        # آپلود و ارسال همزمان فایل‌ها
-        if downloaded_files:
-            print(f"   📦 {len(downloaded_files)} فایل دانلود شد")
-            with ThreadPoolExecutor(max_workers=2) as executor:
-                upload_futures = []
-                for file_path in downloaded_files:
-                    file_type = "Image" if file_path.endswith('.jpg') else "Video"
-                    upload_futures.append(executor.submit(upload_and_send, file_path, file_type, msg['text']))
-                
-                for future in as_completed(upload_futures):
-                    if future.result():
-                        print("   ✓ فایل با موفقیت ارسال شد")
-                    else:
-                        print("   ✗ خطا در ارسال فایل")
-            
-            # پاک کردن فایل‌های موقت
-            for file_path in downloaded_files:
-                try:
-                    os.remove(file_path)
-                except:
-                    pass
-        else:
-            # فقط متن (بدون فایل)
+        for future in as_completed(future_map):
+            msg_id = future_map[future]
             try:
-                rubika_url = f"https://botapi.rubika.ir/v3/{RUBIKA_TOKEN}/sendMessage"
-                payload = {"chat_id": RUBIKA_CHANNEL, "text": clean_and_format(msg['text'])}
-                resp = requests.post(rubika_url, json=payload, headers=RUBIKA_HEADERS, timeout=10)
-                if resp.status_code == 200 and resp.json().get("status") == "OK":
-                    print("   ✓ متن با موفقیت ارسال شد")
-                else:
-                    print("   ✗ خطا در ارسال متن")
+                if future.result():
+                    processed_ids.append(msg_id)
             except Exception as e:
-                print(f"   ✗ خطا: {e}")
-        
-        # ذخیره آخرین ID پردازش شده
-        with open(LAST_ID_FILE, 'w') as f:
-            f.write(str(msg['id']))
-        
-        # تاخیر کوتاه برای جلوگیری از محدودیت
-        time.sleep(0.5)
+                print(f"   ✗ خطا در پردازش پیام {msg_id}: {e}")
     
-    print("\n" + "=" * 50)
-    print("✅ فرآیند اسکرپ با موفقیت به پایان رسید")
-    print("=" * 50)
+    # ذخیره آخرین ID پردازش شده
+    if processed_ids:
+        save_last_processed_id(max(processed_ids))
+    
+    print("\n" + "=" * 55)
+    print("✅ اسکرپ با موفقیت کامل شد")
+    print("=" * 55)
 
 if __name__ == "__main__":
     scrape()
