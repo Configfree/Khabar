@@ -5,7 +5,8 @@ import time
 import json
 import logging
 from bs4 import BeautifulSoup
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from io import BytesIO
 
 # ========== تنظیمات ==========
 RUBIKA_TOKEN = os.environ.get('RUBIKA_TOKEN')
@@ -15,9 +16,12 @@ STATE_FILE = "state.json"
 DOWNLOAD_DIR = "downloads"
 
 # ========== بهینه‌سازی سرعت ==========
-MAX_WORKERS = 3  # دانلود همزمان
-CHUNK_SIZE = 32768  # 32KB برای سرعت بیشتر
-DOWNLOAD_TIMEOUT = 20
+MAX_WORKERS = 2  # تعداد ارسال همزمان
+CHUNK_SIZE = 65536  # 64KB برای دانلود سریعتر
+DOWNLOAD_TIMEOUT = 15
+UPLOAD_TIMEOUT = 15
+COMPRESS_IMAGES = True  # فشرده‌سازی عکس‌ها
+MAX_IMAGE_SIZE_KB = 300  # حداکثر حجم عکس بعد از فشرده‌سازی
 
 FOOTER = """
 ────────────────────
@@ -85,8 +89,58 @@ def save_state(state):
     with open(STATE_FILE, 'w') as f:
         json.dump(state, f, indent=2)
 
+def compress_image(file_path):
+    """فشرده‌سازی عکس برای آپلود سریعتر"""
+    if not COMPRESS_IMAGES:
+        return True
+    
+    try:
+        from PIL import Image
+        
+        # باز کردن عکس
+        img = Image.open(file_path)
+        
+        # تبدیل به RGB اگر RGBA بود
+        if img.mode in ('RGBA', 'P'):
+            img = img.convert('RGB')
+        
+        # محاسبه ابعاد جدید (اگر خیلی بزرگ بود)
+        max_dimension = 1280
+        if max(img.size) > max_dimension:
+            ratio = max_dimension / max(img.size)
+            new_size = tuple(int(dim * ratio) for dim in img.size)
+            img = img.resize(new_size, Image.Resampling.LANCZOS)
+        
+        # فشرده‌سازی با کیفیت متغیر
+        quality = 85
+        output = BytesIO()
+        
+        while quality > 30:
+            output.seek(0)
+            output.truncate()
+            img.save(output, format='JPEG', quality=quality, optimize=True)
+            
+            if output.tell() <= MAX_IMAGE_SIZE_KB * 1024:
+                break
+            
+            quality -= 10
+        
+        # ذخیره فایل فشرده شده
+        with open(file_path, 'wb') as f:
+            f.write(output.getvalue())
+        
+        original_size = os.path.getsize(file_path)
+        compressed_size = len(output.getvalue())
+        
+        logging.info(f"   📦 فشرده‌سازی: {original_size/1024:.0f}KB → {compressed_size/1024:.0f}KB")
+        return True
+        
+    except Exception as e:
+        logging.warning(f"   ⚠️ خطا در فشرده‌سازی: {e}")
+        return False
+
 def download_file_fast(url, file_path):
-    """دانلود سریع با بهینه‌سازی برای GitHub Actions"""
+    """دانلود سریع با بهینه‌سازی"""
     headers = {
         'User-Agent': 'Mozilla/5.0',
         'Accept': '*/*',
@@ -95,61 +149,155 @@ def download_file_fast(url, file_path):
     }
     
     try:
-        # افزایش timeout و استفاده از stream
         response = requests.get(url, stream=True, headers=headers, timeout=DOWNLOAD_TIMEOUT)
         
         if response.status_code == 200:
-            total_size = int(response.headers.get('content-length', 0))
-            downloaded = 0
-            
             with open(file_path, 'wb') as f:
                 for chunk in response.iter_content(chunk_size=CHUNK_SIZE):
                     if chunk:
                         f.write(chunk)
-                        downloaded += len(chunk)
-                        
-                        # نمایش پیشرفت دانلود
-                        if total_size > 0:
-                            percent = (downloaded / total_size) * 100
-                            if percent % 25 < 1:  # هر 25 درصد یکبار لاگ بده
-                                logging.info(f"   📥 دانلود: {percent:.0f}%")
             
-            logging.info(f"   ✅ دانلود شد: {os.path.getsize(file_path)/1024:.1f}KB")
+            file_size_kb = os.path.getsize(file_path) / 1024
+            logging.info(f"   ✅ دانلود: {file_size_kb:.0f}KB")
+            
+            # فشرده‌سازی عکس
+            if file_path.endswith(('.jpg', '.jpeg', '.png')) and COMPRESS_IMAGES:
+                compress_image(file_path)
+            
             return True
         else:
-            logging.warning(f"   ⚠️ کد خطا: {response.status_code}")
             return False
             
     except Exception as e:
         logging.error(f"   ❌ خطا: {e}")
         return False
 
-def extract_album_group(messages):
-    """تشخیص درست آلبوم‌ها با استفاده از ساختار HTML تلگرام"""
-    groups = {}
+def send_to_rubika_optimized(content_type, file_path=None, caption=""):
+    """ارسال بهینه به روبیکا با timeout کمتر"""
+    if not RUBIKA_TOKEN:
+        return None
     
-    for msg in messages:
-        # بررسی پیام‌های گروهی (آلبوم)
-        grouped_wrap = msg.select_one('.tgme_widget_message_grouped_wrap')
-        if grouped_wrap:
-            # پیدا کردن والد مشترک برای گروه
-            parent = msg.find_previous_sibling(class_='tgme_widget_message_grouped_wrap')
-            if parent:
-                # از data-post اولین و آخرین پیام گروه استفاده کن
-                first_msg = parent.find_next(class_='tgme_widget_message')
-                if first_msg:
-                    group_key = first_msg.get('data-post', '').split('/')[-1]
-                    if group_key not in groups:
-                        groups[group_key] = []
-                    groups[group_key].append(msg)
+    cleaned_caption = clean_and_format(caption)
+    if len(cleaned_caption) > 4000:
+        cleaned_caption = cleaned_caption[:3997] + "..."
     
-    return groups
+    rubika_url = f"https://botapi.rubika.ir/v3/{RUBIKA_TOKEN}/"
+    headers = {"Content-Type": "application/json"}
+    
+    try:
+        if content_type == "text":
+            payload = {"chat_id": RUBIKA_CHANNEL, "text": cleaned_caption}
+            start_time = time.time()
+            response = requests.post(
+                rubika_url + "sendMessage",
+                data=json.dumps(payload),
+                headers=headers,
+                timeout=10
+            )
+            elapsed = time.time() - start_time
+            logging.info(f"   ✓ متن ارسال شد ({elapsed:.1f}s)")
+            return response
+        
+        elif content_type in ["photo", "video"]:
+            file_type = "Image" if content_type == "photo" else "Video"
+            
+            # مرحله 1: درخواست آپلود
+            start_time = time.time()
+            resp_upload = requests.post(
+                rubika_url + "requestSendFile",
+                data=json.dumps({"type": file_type}),
+                headers=headers,
+                timeout=8
+            )
+            
+            if resp_upload.status_code != 200:
+                return None
+                
+            upload_data = resp_upload.json()
+            if upload_data.get("status") != "OK":
+                return None
+                
+            upload_url = upload_data["data"]["upload_url"]
+            
+            # مرحله 2: آپلود فایل
+            with open(file_path, 'rb') as f:
+                resp_file = requests.post(
+                    upload_url, 
+                    files={"file": f}, 
+                    timeout=UPLOAD_TIMEOUT
+                )
+                
+            file_data = resp_file.json()
+            if file_data.get("status") != "OK":
+                return None
+                
+            file_id = file_data["data"]["file_id"]
+            
+            # مرحله 3: ارسال نهایی
+            payload = {
+                "chat_id": RUBIKA_CHANNEL,
+                "file_id": file_id,
+                "text": cleaned_caption if content_type == "photo" else cleaned_caption
+            }
+            
+            response = requests.post(
+                rubika_url + "sendFile",
+                data=json.dumps(payload),
+                headers=headers,
+                timeout=8
+            )
+            
+            elapsed = time.time() - start_time
+            file_size_kb = os.path.getsize(file_path) / 1024
+            logging.info(f"   ✓ {content_type} ارسال شد ({file_size_kb:.0f}KB, {elapsed:.1f}s)")
+            
+            return response
+            
+    except Exception as e:
+        logging.error(f"   ✗ خطا: {e}")
+        return None
+
+def send_album_parallel(photos, caption, msg_id):
+    """ارسال همزمان عکس‌های آلبوم برای افزایش سرعت"""
+    downloaded_files = []
+    
+    # مرحله 1: دانلود همه عکس‌ها
+    for idx, photo_url in enumerate(photos):
+        file_path = f"{DOWNLOAD_DIR}/album_{msg_id}_{idx}.jpg"
+        if download_file_fast(photo_url, file_path):
+            downloaded_files.append((file_path, idx))
+        else:
+            logging.warning(f"   ⚠️ خطا در دانلود عکس {idx+1}")
+    
+    if not downloaded_files:
+        return
+    
+    # مرحله 2: ارسال همزمان
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = []
+        
+        for file_path, idx in downloaded_files:
+            if idx == len(photos) - 1:
+                future = executor.submit(send_to_rubika_optimized, "photo", file_path, caption)
+            else:
+                future = executor.submit(send_to_rubika_optimized, "photo", file_path, "")
+            futures.append((future, file_path))
+        
+        # مرحله 3: انتظار برای اتمام و پاکسازی
+        for future, file_path in futures:
+            try:
+                future.result(timeout=30)
+            except:
+                pass
+            if os.path.exists(file_path):
+                os.remove(file_path)
+        
+        time.sleep(0.1)  # تاخیر کم بین گروه‌ها
 
 def extract_album_photos(message):
     """استخراج تمام عکس‌های آلبوم"""
     photos = []
     
-    # بررسی آلبوم گروهی
     grouped_wrap = message.select_one('.tgme_widget_message_grouped_wrap')
     if grouped_wrap:
         photo_wraps = grouped_wrap.select('a.tgme_widget_message_photo_wrap')
@@ -162,7 +310,6 @@ def extract_album_photos(message):
                 photos.append(url)
         return photos
     
-    # تک عکس
     photo_wrap = message.select_one('a.tgme_widget_message_photo_wrap')
     if photo_wrap:
         style = photo_wrap.get('style', '')
@@ -174,90 +321,10 @@ def extract_album_photos(message):
     
     return photos
 
-def send_to_rubika_fast(content_type, file_path=None, caption=""):
-    """ارسال سریع به روبیکا"""
-    if not RUBIKA_TOKEN:
-        logging.error("RUBIKA_TOKEN تنظیم نشده")
-        return None
-    
-    cleaned_caption = clean_and_format(caption)
-    
-    if len(cleaned_caption) > 4000:
-        cleaned_caption = cleaned_caption[:3997] + "..."
-    
-    rubika_url = f"https://botapi.rubika.ir/v3/{RUBIKA_TOKEN}/"
-    headers = {"Content-Type": "application/json"}
-    
-    try:
-        if content_type == "text":
-            payload = {"chat_id": RUBIKA_CHANNEL, "text": cleaned_caption}
-            response = requests.post(
-                rubika_url + "sendMessage",
-                data=json.dumps(payload),
-                headers=headers,
-                timeout=15
-            )
-            
-            if response.status_code == 200 and response.json().get("status") == "OK":
-                logging.info("   ✓ متن ارسال شد")
-            return response
-        
-        elif content_type in ["photo", "video"]:
-            file_type = "Image" if content_type == "photo" else "Video"
-            
-            # دریافت آدرس آپلود
-            resp_upload = requests.post(
-                rubika_url + "requestSendFile",
-                data=json.dumps({"type": file_type}),
-                headers=headers,
-                timeout=15
-            )
-            
-            if resp_upload.status_code != 200:
-                return None
-                
-            upload_data = resp_upload.json()
-            if upload_data.get("status") != "OK":
-                return None
-                
-            upload_url = upload_data["data"]["upload_url"]
-            
-            # آپلود فایل با chunk مناسب
-            with open(file_path, 'rb') as f:
-                resp_file = requests.post(upload_url, files={"file": f}, timeout=30)
-                
-            file_data = resp_file.json()
-            if file_data.get("status") != "OK":
-                return None
-                
-            file_id = file_data["data"]["file_id"]
-            
-            # ارسال به کانال
-            payload = {
-                "chat_id": RUBIKA_CHANNEL,
-                "file_id": file_id,
-                "text": cleaned_caption if content_type == "photo" else cleaned_caption
-            }
-            
-            response = requests.post(
-                rubika_url + "sendFile",
-                data=json.dumps(payload),
-                headers=headers,
-                timeout=15
-            )
-            
-            if response.status_code == 200 and response.json().get("status") == "OK":
-                logging.info(f"   ✓ {content_type} ارسال شد")
-            return response
-            
-    except Exception as e:
-        logging.error(f"   ✗ خطا: {e}")
-        return None
-
 def scrape():
     """تابع اصلی اسکرپ"""
     print("=" * 55)
-    print("       اسکرپ کانال خبری - NewsLine360")
+    print("       اسکرپ کانال خبری - NewsLine360 (بهینه)")
     print("=" * 55)
     
     if not RUBIKA_TOKEN:
@@ -265,6 +332,14 @@ def scrape():
         return
     
     os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+    
+    # بررسی وجود PIL برای فشرده‌سازی
+    if COMPRESS_IMAGES:
+        try:
+            from PIL import Image
+            logging.info("✅ فشرده‌سازی عکس فعال است")
+        except ImportError:
+            logging.warning("⚠️ PIL نصب نیست - لطفاً نصب کنید: pip install Pillow")
     
     url = f"https://t.me/s/{SOURCE_CHANNEL}"
     logging.info(f"\n🔍 در حال بررسی کانال: t.me/{SOURCE_CHANNEL}")
@@ -287,7 +362,7 @@ def scrape():
     last_id = state["last_id"]
     logging.info(f"📌 آخرین ID: {last_id}")
     
-    # پردازش از جدید به قدیم
+    # پردازش پیام‌های جدید
     new_messages = []
     for msg in messages:
         data_post = msg.get('data-post', '')
@@ -303,66 +378,61 @@ def scrape():
         logging.info("📭 پیام جدیدی یافت نشد")
         return
     
-    # مرتب‌سازی از قدیم به جدید
     new_messages.sort(key=lambda x: x[0])
     logging.info(f"📨 {len(new_messages)} پیام جدید")
     
     # پردازش پیام‌ها
     max_id = last_id
+    total_start = time.time()
     
     for msg_id, msg in new_messages:
-        # استخراج متن
         text_elem = msg.select_one('.tgme_widget_message_text')
         text = text_elem.get_text() if text_elem else ""
         
-        # فقط پیام‌هایی که تگ دارند
         if '@KhabarFuri' not in text:
             continue
         
         logging.info(f"\n📥 پیام {msg_id}")
+        start_time = time.time()
         
-        # استخراج عکس‌ها (آلبوم یا تک عکس)
+        # استخراج عکس‌ها
         photos = extract_album_photos(msg)
         
         if photos:
             logging.info(f"   📸 {len(photos)} عکس")
-            # ارسال عکس اول بدون متن، بقیه با متن
-            for idx, photo_url in enumerate(photos):
-                file_path = f"{DOWNLOAD_DIR}/photo_{msg_id}_{idx}.jpg"
-                if download_file_fast(photo_url, file_path):
-                    if idx == len(photos) - 1:
-                        send_to_rubika_fast("photo", file_path, text)
-                    else:
-                        send_to_rubika_fast("photo", file_path, "")
-                    os.remove(file_path)
-                    time.sleep(0.3)
+            send_album_parallel(photos, text, msg_id)
             max_id = max(max_id, msg_id)
+            elapsed = time.time() - start_time
+            logging.info(f"   ⏱️ زمان کل: {elapsed:.1f}s")
             continue
         
         # ویدیو
         video_elem = msg.select_one('video, source')
         if video_elem and video_elem.get('src'):
             video_url = video_elem.get('src')
-            logging.info(f"   🎥 دانلود ویدیو...")
             file_path = f"{DOWNLOAD_DIR}/video_{msg_id}.mp4"
             if download_file_fast(video_url, file_path):
-                send_to_rubika_fast("video", file_path, text)
+                send_to_rubika_optimized("video", file_path, text)
                 os.remove(file_path)
             max_id = max(max_id, msg_id)
+            elapsed = time.time() - start_time
+            logging.info(f"   ⏱️ زمان کل: {elapsed:.1f}s")
             continue
         
         # فقط متن
-        logging.info(f"   📝 ارسال متن")
-        send_to_rubika_fast("text", caption=text)
+        send_to_rubika_optimized("text", caption=text)
         max_id = max(max_id, msg_id)
-        
-        time.sleep(0.5)
+        elapsed = time.time() - start_time
+        logging.info(f"   ⏱️ زمان کل: {elapsed:.1f}s")
     
-    # ذخیره آخرین ID
+    # ذخیره state
     if max_id > last_id:
         save_state({"last_id": max_id, "processed_groups": []})
         logging.info(f"✅ ذخیره شد - آخرین ID: {max_id}")
     
+    total_elapsed = time.time() - total_start
+    print("=" * 55)
+    print(f"✅ اسکرپ کامل شد - زمان کل: {total_elapsed:.1f} ثانیه")
     print("=" * 55)
 
 if __name__ == "__main__":
