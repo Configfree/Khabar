@@ -1,0 +1,25 @@
+name: Telegram to Rubika Forwarder
+
+on:
+  workflow_dispatch:  # فقط اجرای دستی
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Setup Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+        
+    - name: Install dependencies
+      run: pip install -r requirements.txt
+      
+    - name: Run scraper
+      env:
+        RUBIKA_TOKEN: ${{ secrets.RUBIKA_TOKEN }}
+      run: python scraper.py
