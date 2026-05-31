@@ -14,7 +14,7 @@ SOURCE_CHANNEL = "KhabarFuri"
 STATE_FILE = "state.json"
 DOWNLOAD_DIR = "downloads"
 
-# ========== بهینه‌سازی ==========
+# ========== بهینه‌سازی سرعت ==========
 CHUNK_SIZE = 65536
 DOWNLOAD_TIMEOUT = 15
 UPLOAD_TIMEOUT = 15
@@ -74,7 +74,6 @@ def clean_and_format(text):
     return text
 
 def load_state():
-    """بارگذاری atomic state"""
     if os.path.exists(STATE_FILE):
         try:
             with open(STATE_FILE, 'r') as f:
@@ -82,13 +81,13 @@ def load_state():
                 if "last_id" not in state:
                     state["last_id"] = 0
                 return state
-        except:
+        except (json.JSONDecodeError, ValueError):
             logging.warning("⚠️ فایل state خراب است، ریست می‌شود")
             return {"last_id": 0}
     return {"last_id": 0}
 
 def save_state_atomic(state):
-    """ذخیره atomic state با فایل موقت"""
+    """ذخیره اتمیک state - از corruption جلوگیری می‌کند"""
     tmp_file = STATE_FILE + ".tmp"
     try:
         with open(tmp_file, 'w') as f:
@@ -122,7 +121,7 @@ def download_file_fast(url, file_path):
             logging.info(f"   ✅ دانلود: {original_size_kb:.0f}KB")
             
             if file_path.endswith(('.jpg', '.jpeg', '.png')) and COMPRESS_IMAGES:
-                compress_image_safe(file_path, original_size_kb)
+                compress_image_fast(file_path, original_size_kb)
             
             return True
         else:
@@ -132,53 +131,40 @@ def download_file_fast(url, file_path):
         logging.error(f"   ❌ خطا در دانلود: {e}")
         return False
 
-def compress_image_safe(file_path, original_size_kb):
-    """فشرده‌سازی ایمن با حفظ شفافیت PNG"""
+def compress_image_fast(file_path, original_size_kb):
+    """فشرده‌سازی سریع عکس"""
     try:
         from PIL import Image
         
-        img = Image.open(file_path)
-        original_format = img.format
-        
-        # فقط عکس‌های بزرگ رو فشرده کن
         if original_size_kb < 100:
             return True
         
-        # برای PNG شفاف، فشرده نکن (کیفیت رو حفظ کن)
-        if original_format == 'PNG' and img.mode == 'RGBA':
-            logging.info(f"   📦 PNG شفاف - فشرده‌سازی نمی‌شود")
-            return True
+        img = Image.open(file_path)
         
-        # تبدیل به RGB برای JPEG
         if img.mode in ('RGBA', 'P'):
-            img = img.convert('RGB')
+            if img.format == 'PNG' and img.mode == 'RGBA':
+                max_dimension = 1280
+                if max(img.size) > max_dimension:
+                    ratio = max_dimension / max(img.size)
+                    new_size = tuple(int(dim * ratio) for dim in img.size)
+                    img = img.resize(new_size, Image.Resampling.LANCZOS)
+                    img.save(file_path, format='PNG', optimize=True)
+                    new_size_kb = os.path.getsize(file_path) / 1024
+                    logging.info(f"   📦 بهینه‌سازی PNG: {original_size_kb:.0f}KB → {new_size_kb:.0f}KB")
+                return True
+            else:
+                img = img.convert('RGB')
         
-        # کاهش ابعاد اگر خیلی بزرگ بود
         max_dimension = 1280
         if max(img.size) > max_dimension:
             ratio = max_dimension / max(img.size)
             new_size = tuple(int(dim * ratio) for dim in img.size)
             img = img.resize(new_size, Image.Resampling.LANCZOS)
         
-        # فشرده‌سازی پلکانی
-        quality = 85
-        output = BytesIO()
+        quality = 75
+        img.save(file_path, format='JPEG', quality=quality, optimize=True)
         
-        while quality > 30:
-            output.seek(0)
-            output.truncate()
-            img.save(output, format='JPEG', quality=quality, optimize=True)
-            
-            if output.tell() <= MAX_IMAGE_SIZE_KB * 1024:
-                break
-            
-            quality -= 10
-        
-        # ذخیره فایل فشرده شده
-        with open(file_path, 'wb') as f:
-            f.write(output.getvalue())
-        
-        new_size_kb = len(output.getvalue()) / 1024
+        new_size_kb = os.path.getsize(file_path) / 1024
         saved_percent = (1 - new_size_kb / original_size_kb) * 100 if original_size_kb > 0 else 0
         
         if saved_percent > 10:
@@ -220,7 +206,7 @@ def extract_album_photos(message):
     return photos
 
 def send_to_rubika(content_type, file_path=None, caption=""):
-    """ارسال به روبیکا با بازگشت وضعیت موفقیت"""
+    """ارسال به روبیکا با مدیریت خطای JSON"""
     if not RUBIKA_TOKEN:
         return False
     
@@ -243,12 +229,17 @@ def send_to_rubika(content_type, file_path=None, caption=""):
             )
             elapsed = time.time() - start_time
             
-            if response.status_code == 200 and response.json().get("status") == "OK":
-                logging.info(f"   ✓ متن ارسال شد ({elapsed:.1f}s)")
-                return True
-            else:
-                logging.error(f"   ✗ خطا در ارسال متن")
-                return False
+            if response.status_code == 200:
+                try:
+                    result = response.json()
+                    if result.get("status") == "OK":
+                        logging.info(f"   ✓ متن ارسال شد ({elapsed:.1f}s)")
+                        return True
+                except:
+                    pass
+            
+            logging.error(f"   ✗ خطا در ارسال متن")
+            return False
         
         elif content_type in ["photo", "video"]:
             file_type = "Image" if content_type == "photo" else "Video"
@@ -264,7 +255,11 @@ def send_to_rubika(content_type, file_path=None, caption=""):
             if resp_upload.status_code != 200:
                 return False
                 
-            upload_data = resp_upload.json()
+            try:
+                upload_data = resp_upload.json()
+            except:
+                return False
+                
             if upload_data.get("status") != "OK":
                 return False
                 
@@ -277,7 +272,11 @@ def send_to_rubika(content_type, file_path=None, caption=""):
                     timeout=UPLOAD_TIMEOUT
                 )
                 
-            file_data = resp_file.json()
+            try:
+                file_data = resp_file.json()
+            except:
+                return False
+                
             if file_data.get("status") != "OK":
                 return False
                 
@@ -299,54 +298,54 @@ def send_to_rubika(content_type, file_path=None, caption=""):
             elapsed = time.time() - start_time
             file_size_kb = os.path.getsize(file_path) / 1024
             
-            if response.status_code == 200 and response.json().get("status") == "OK":
-                logging.info(f"   ✓ {content_type} ارسال شد ({file_size_kb:.0f}KB, {elapsed:.1f}s)")
-                return True
-            else:
-                logging.error(f"   ✗ خطا در ارسال {content_type}")
-                return False
+            if response.status_code == 200:
+                try:
+                    result = response.json()
+                    if result.get("status") == "OK":
+                        logging.info(f"   ✓ {content_type} ارسال شد ({file_size_kb:.0f}KB, {elapsed:.1f}s)")
+                        return True
+                except:
+                    pass
+            
+            logging.error(f"   ✗ خطا در ارسال {content_type}")
+            return False
             
     except Exception as e:
         logging.error(f"   ✗ خطا: {e}")
         return False
 
 def send_album_sequential(photos, caption, msg_id):
-    """ارسال پشت سر هم عکس‌های آلبوم با چک موفقیت"""
+    """ارسال پشت سر هم عکس‌های آلبوم"""
     downloaded_files = []
     
-    # مرحله 1: دانلود همه عکس‌ها
     for idx, photo_url in enumerate(photos):
         file_path = f"{DOWNLOAD_DIR}/album_{msg_id}_{idx}.jpg"
         if download_file_fast(photo_url, file_path):
-            downloaded_files.append((file_path, idx))
+            downloaded_files.append(file_path)
         else:
             logging.warning(f"   ⚠️ خطا در دانلود عکس {idx+1}")
     
     if not downloaded_files:
         return False
     
-    # مرحله 2: ارسال پشت سر هم
-    success_count = 0
-    for idx, (file_path, _) in enumerate(downloaded_files):
+    success = True
+    for idx, file_path in enumerate(downloaded_files):
         if idx == len(downloaded_files) - 1:
-            success = send_to_rubika("photo", file_path, caption)
+            if not send_to_rubika("photo", file_path, caption):
+                success = False
         else:
-            success = send_to_rubika("photo", file_path, "")
-        
-        if success:
-            success_count += 1
+            if not send_to_rubika("photo", file_path, ""):
+                success = False
         
         if os.path.exists(file_path):
             os.remove(file_path)
-        
-        time.sleep(0.2)  # کاهش تاخیر بین عکس‌ها
     
-    return success_count == len(downloaded_files)
+    return success
 
 def scrape():
-    """نسخه Production-Grade با atomic state و check success"""
+    """نسخه نهایی با atomic state و حذف sleep اضافی"""
     print("=" * 55)
-    print("       اسکرپ کانال خبری - NewsLine360 (نسخه نهایی)")
+    print("       اسکرپ کانال خبری - NewsLine360")
     print("=" * 55)
     
     if not RUBIKA_TOKEN:
@@ -379,128 +378,97 @@ def scrape():
         logging.warning("⚠️ هیچ پیامی پیدا نشد")
         return
     
-    # پیدا کردن آخرین و اولین ID در صفحه
-    latest_id_in_page = 0
-    earliest_id_in_page = float('inf')
-    id_map = {}
-    
+    msg_dict = {}
     for msg in messages:
         data_post = msg.get('data-post', '')
         if data_post:
             try:
                 msg_id = int(data_post.split('/')[-1])
-                latest_id_in_page = max(latest_id_in_page, msg_id)
-                earliest_id_in_page = min(earliest_id_in_page, msg_id)
-                id_map[msg_id] = msg
+                msg_dict[msg_id] = msg
             except:
                 pass
     
+    if not msg_dict:
+        logging.warning("⚠️ هیچ ID معتبری پیدا نشد")
+        return
+    
+    latest_id_in_page = max(msg_dict.keys())
+    earliest_id_in_page = min(msg_dict.keys())
+    
     state = load_state()
-    last_id = state["last_id"]
+    last_id = state.get("last_id", 0)
     
     logging.info(f"📌 آخرین ID ذخیره شده: {last_id}")
     logging.info(f"📌 محدوده ID در صفحه: {earliest_id_in_page} تا {latest_id_in_page}")
     
-    # ========== مدیریت GAP (فقط هشدار، بدون action) ==========
-    if last_id > 0 and earliest_id_in_page > last_id + 1:
-        gap_size = earliest_id_in_page - last_id - 1
-        gap_start = last_id + 1
-        gap_end = earliest_id_in_page - 1
-        
-        logging.warning("=" * 55)
-        logging.warning(f"⚠️ GAP شناسایی شد!")
-        logging.warning(f"⚠️ پیام‌های {gap_start} تا {gap_end} (تعداد {gap_size} پیام) از دست رفته")
-        logging.warning(f"⚠️ این پیام‌ها در وب تلگرام موجود نیستند")
-        logging.warning(f"✅ اما پیام‌های جدید {earliest_id_in_page} تا {latest_id_in_page} ارسال می‌شوند")
-        logging.warning("=" * 55)
+    # پیدا کردن پیام‌های جدید
+    new_msg_ids = [msg_id for msg_id in msg_dict.keys() if msg_id > last_id]
     
-    # ========== پردازش پیام‌های جدید ==========
-    new_messages = []
-    for msg_id, msg in id_map.items():
-        if msg_id > last_id:
-            new_messages.append((msg_id, msg))
-    
-    if not new_messages:
+    if not new_msg_ids:
         logging.info("📭 پیام جدیدی یافت نشد")
-        
-        # اگر پیام جدیدی نبود، اما gap داشتیم، last_id رو آپدیت کن
-        if last_id > 0 and latest_id_in_page > last_id:
-            logging.info(f"🔄 آپدیت last_id از {last_id} به {latest_id_in_page}")
+        if latest_id_in_page > last_id:
             state["last_id"] = latest_id_in_page
             save_state_atomic(state)
+            logging.info(f"🔄 آپدیت last_id به {latest_id_in_page}")
         return
     
-    new_messages.sort(key=lambda x: x[0])
-    logging.info(f"📨 {len(new_messages)} پیام جدید برای پردازش")
+    new_msg_ids.sort()
+    logging.info(f"📨 {len(new_msg_ids)} پیام جدید برای پردازش")
     
-    # پردازش پیام‌ها
-    for msg_id, msg in new_messages:
+    # پردازش - بدون sleep اضافی
+    max_processed_id = last_id
+    
+    for msg_id in new_msg_ids:
+        msg = msg_dict[msg_id]
+        
+        # آپدیت ID بدون شرط (نکته 2)
+        if msg_id > max_processed_id:
+            max_processed_id = msg_id
+        
+        # استخراج متن
         text_elem = msg.select_one('.tgme_widget_message_text')
         text = text_elem.get_text() if text_elem else ""
         
-        # فیلتر تگ با روش ایمن‌تر
-        if not text or SOURCE_CHANNEL.lower() not in text.lower():
+        # چک کردن تگ
+        if '@KhabarFuri' not in text:
             logging.info(f"⏩ پیام {msg_id} رد شد (بدون تگ)")
             continue
         
         logging.info(f"\n📥 پردازش پیام {msg_id}")
         start_time = time.time()
         
-        # استخراج عکس‌ها
         photos = extract_album_photos(msg)
         
         if photos:
-            logging.info(f"   📸 {len(photos)} عکس (ارسال پشت سر هم)")
-            success = send_album_sequential(photos, text, msg_id)
-            
-            if success:
-                # فقط بعد از موفقیت کامل، state رو آپدیت کن
-                if msg_id > state["last_id"]:
-                    state["last_id"] = msg_id
-                    save_state_atomic(state)
-                    logging.info(f"   💾 state ذخیره شد - last_id: {msg_id}")
-            else:
-                logging.warning(f"   ⚠️ برخی از عکس‌ها ارسال نشدند - state آپدیت نشد")
-            
-            elapsed = time.time() - start_time
-            logging.info(f"   ⏱️ زمان کل: {elapsed:.1f}s")
+            logging.info(f"   📸 {len(photos)} عکس")
+            if send_album_sequential(photos, text, msg_id):
+                state["last_id"] = max_processed_id
+                save_state_atomic(state)
+                logging.info(f"   💾 state ذخیره شد - last_id: {max_processed_id}")
             continue
         
-        # ویدیو
         video_elem = msg.select_one('video, source')
         if video_elem and video_elem.get('src'):
             video_url = video_elem.get('src')
             file_path = f"{DOWNLOAD_DIR}/video_{msg_id}.mp4"
             if download_file_fast(video_url, file_path):
-                success = send_to_rubika("video", file_path, text)
-                os.remove(file_path)
-                
-                if success and msg_id > state["last_id"]:
-                    state["last_id"] = msg_id
+                if send_to_rubika("video", file_path, text):
+                    state["last_id"] = max_processed_id
                     save_state_atomic(state)
-                    logging.info(f"   💾 state ذخیره شد - last_id: {msg_id}")
-            else:
-                logging.warning(f"   ⚠️ خطا در دانلود ویدیو")
-            
-            elapsed = time.time() - start_time
-            logging.info(f"   ⏱️ زمان کل: {elapsed:.1f}s")
+                    logging.info(f"   💾 state ذخیره شد - last_id: {max_processed_id}")
+                os.remove(file_path)
             continue
         
-        # فقط متن
-        success = send_to_rubika("text", caption=text)
-        
-        if success and msg_id > state["last_id"]:
-            state["last_id"] = msg_id
+        if send_to_rubika("text", caption=text):
+            state["last_id"] = max_processed_id
             save_state_atomic(state)
-            logging.info(f"   💾 state ذخیره شد - last_id: {msg_id}")
+            logging.info(f"   💾 state ذخیره شد - last_id: {max_processed_id}")
         
         elapsed = time.time() - start_time
-        logging.info(f"   ⏱️ زمان کل: {elapsed:.1f}s")
-        
-        time.sleep(0.2)
+        logging.info(f"   ⏱️ زمان: {elapsed:.1f}s")
     
-    # بعد از اتمام، آخرین ID را آپدیت کن
-    if latest_id_in_page > state["last_id"]:
+    # آپدیت نهایی
+    if latest_id_in_page > max_processed_id:
         state["last_id"] = latest_id_in_page
         save_state_atomic(state)
         logging.info(f"🔄 آپدیت نهایی last_id به {latest_id_in_page}")
