@@ -2,6 +2,9 @@ name: Scrape Telegram Channel
 
 on:
   workflow_dispatch:  # فقط اجرای دستی
+  # اگر بعداً خواستی خودکار بشه، این خط رو از حالت کامنت در بیار:
+  # schedule:
+  #   - cron: '*/10 * * * *'  # هر 10 دقیقه
 
 jobs:
   scrape:
@@ -12,6 +15,7 @@ jobs:
       uses: actions/checkout@v3
       with:
         persist-credentials: true
+        fetch-depth: 0  # برای دسترسی به تاریخچه git
     
     - name: Set up Python
       uses: actions/setup-python@v4
@@ -20,17 +24,48 @@ jobs:
     
     - name: Install dependencies
       run: |
+        pip install --upgrade pip
         pip install requests beautifulsoup4
+    
+    - name: Create downloads directory
+      run: |
+        mkdir -p downloads
     
     - name: Run scraper
       env:
         RUBIKA_TOKEN: ${{ secrets.RUBIKA_TOKEN }}
+        PYTHONUNBUFFERED: "1"  # نمایش لحظه‌ای لاگ‌ها
       run: |
         python scraper.py
     
     - name: Commit and push state file
+      if: always()  # حتی اگر خطا هم بیاد، state رو ذخیره کن
       run: |
         git config user.name "github-actions[bot]"
         git config user.email "github-actions[bot]@users.noreply.github.com"
+        
+        # اضافه کردن فایل state
         git add state.json
-        git diff --quiet && git diff --staged --quiet || (git commit -m "Update state [skip ci]" && git push)
+        
+        # اگر تغییری وجود داشت، commit و push کن
+        if git diff --staged --quiet; then
+          echo "No changes to commit"
+        else
+          git commit -m "Update state [skip ci]"
+          git push
+        fi
+    
+    - name: Cleanup downloads
+      if: always()
+      run: |
+        rm -rf downloads
+        echo "Cleaned up temporary files"
+    
+    - name: Show summary
+      if: always()
+      run: |
+        echo "## اجرای اسکرپت completed" >> $GITHUB_STEP_SUMMARY
+        echo "- زمان اجرا: $(date)" >> $GITHUB_STEP_SUMMARY
+        if [ -f state.json ]; then
+          echo "- آخرین ID: $(cat state.json | jq -r '.last_id')" >> $GITHUB_STEP_SUMMARY
+        fi
