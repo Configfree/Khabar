@@ -1,4 +1,4 @@
-name: Telegram to Rubika Forwarder
+name: Scrape Telegram Channel
 
 on:
   workflow_dispatch:  # فقط اجرای دستی
@@ -8,18 +8,29 @@ jobs:
     runs-on: ubuntu-latest
     
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-      
-    - name: Setup Python
-      uses: actions/setup-python@v5
+    - name: Checkout repository
+      uses: actions/checkout@v3
       with:
-        python-version: '3.11'
-        
+        persist-credentials: true
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.10'
+    
     - name: Install dependencies
-      run: pip install -r requirements.txt
-      
+      run: |
+        pip install requests beautifulsoup4
+    
     - name: Run scraper
       env:
         RUBIKA_TOKEN: ${{ secrets.RUBIKA_TOKEN }}
-      run: python scraper.py
+      run: |
+        python scraper.py
+    
+    - name: Commit and push state file
+      run: |
+        git config user.name "github-actions[bot]"
+        git config user.email "github-actions[bot]@users.noreply.github.com"
+        git add state.json
+        git diff --quiet && git diff --staged --quiet || (git commit -m "Update state [skip ci]" && git push)
