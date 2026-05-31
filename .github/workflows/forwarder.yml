@@ -1,10 +1,7 @@
 name: Scrape Telegram Channel
 
 on:
-  workflow_dispatch:  # فقط اجرای دستی
-  # اگر بعداً خواستی خودکار بشه، این خط رو از حالت کامنت در بیار:
-  # schedule:
-  #   - cron: '*/10 * * * *'  # هر 10 دقیقه
+  workflow_dispatch:
 
 jobs:
   scrape:
@@ -15,7 +12,7 @@ jobs:
       uses: actions/checkout@v3
       with:
         persist-credentials: true
-        fetch-depth: 0  # برای دسترسی به تاریخچه git
+        fetch-depth: 0
     
     - name: Set up Python
       uses: actions/setup-python@v4
@@ -25,7 +22,7 @@ jobs:
     - name: Install dependencies
       run: |
         pip install --upgrade pip
-        pip install requests beautifulsoup4
+        pip install -r requirements.txt
     
     - name: Create downloads directory
       run: |
@@ -34,38 +31,25 @@ jobs:
     - name: Run scraper
       env:
         RUBIKA_TOKEN: ${{ secrets.RUBIKA_TOKEN }}
-        PYTHONUNBUFFERED: "1"  # نمایش لحظه‌ای لاگ‌ها
+        PYTHONUNBUFFERED: "1"
       run: |
         python scraper.py
     
     - name: Commit and push state file
-      if: always()  # حتی اگر خطا هم بیاد، state رو ذخیره کن
+      if: always()
       run: |
         git config user.name "github-actions[bot]"
         git config user.email "github-actions[bot]@users.noreply.github.com"
-        
-        # اضافه کردن فایل state
+        git pull origin main --rebase
         git add state.json
-        
-        # اگر تغییری وجود داشت، commit و push کن
         if git diff --staged --quiet; then
           echo "No changes to commit"
         else
           git commit -m "Update state [skip ci]"
-          git push
+          git push origin main
         fi
     
     - name: Cleanup downloads
       if: always()
       run: |
         rm -rf downloads
-        echo "Cleaned up temporary files"
-    
-    - name: Show summary
-      if: always()
-      run: |
-        echo "## اجرای اسکرپت completed" >> $GITHUB_STEP_SUMMARY
-        echo "- زمان اجرا: $(date)" >> $GITHUB_STEP_SUMMARY
-        if [ -f state.json ]; then
-          echo "- آخرین ID: $(cat state.json | jq -r '.last_id')" >> $GITHUB_STEP_SUMMARY
-        fi
