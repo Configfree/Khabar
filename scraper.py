@@ -11,7 +11,7 @@ from requests.adapters import HTTPAdapter
 
 # ========== تنظیمات ==========
 RUBIKA_TOKEN = os.environ.get('RUBIKA_TOKEN')
-RUBIKA_CHANNEL = "@NewsLine360"
+RUBIKA_CHANNEL = "https://rubika.ir/joinc/DJFBDEBI0CMBIKIJBICVQBABVCSUPZGE"
 SOURCE_CHANNEL = "KhabarFuri"
 STATE_FILE = "state.json"
 DOWNLOAD_DIR = "downloads"
